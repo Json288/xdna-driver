@@ -5,6 +5,7 @@
 #include "hwctx.h"
 #include "exec_buf.h"
 #include "io_config.h"
+#include "core/common/aiebu/src/cpp/aiebu/src/include/aiebu_assembler.h"
 
 #include <string>
 #include <regex>
@@ -62,7 +63,48 @@ get_bin_size(const std::string& filename)
   return ifs.tellg();
 }
 
+std::tuple<uint32_t, uint32_t, uint32_t>
+get_ofm_format(const std::string& config_file)
+{
+    std::ifstream config(config_file);
+    if (!config)
+      return { 0, 0, 0 };
+
+    std::map<std::string, uint32_t> conf;
+    std::string line;
+    while (std::getline(config, line)) {
+        std::istringstream iss(line);
+        std::string key, value;
+        if (std::getline(iss, key, '=') && std::getline(iss, value))
+            conf[key] = std::stoul(value);
+    }
+    return { conf["valid_bytes_per_section"], conf["section_size"], conf["total_size"] };
 }
+
+xrt::elf
+txn2elf(std::vector<char>& txn_buf)
+{
+  aiebu::aiebu_assembler as(aiebu::aiebu_assembler::buffer_type::blob_instr_transaction, txn_buf);
+  auto elf_buf = as.get_elf();
+  std::istringstream elf_stream;
+  elf_stream.rdbuf()->pubsetbuf(elf_buf.data(), elf_buf.size());
+  xrt::elf elf{elf_stream};
+  return elf;
+}
+
+const xrt::elf
+txn_file2elf(const std::string& filename)
+{
+  size_t instr_size = get_bin_size(filename);
+  if (instr_size == 0)
+    throw std::runtime_error("Zero instruction length");
+
+  std::vector<char> txn_buf(instr_size);
+  read_data_from_bin(filename, 0, instr_size, reinterpret_cast<int*>(txn_buf.data()));
+  return txn2elf(txn_buf);
+}
+
+} // namespace
 
 io_test_bo_set_base::
 io_test_bo_set_base(device* dev, const std::string& xclbin_name) :
@@ -138,7 +180,7 @@ io_test_bo_set(device* dev) : io_test_bo_set(dev, get_xclbin_name(dev))
 elf_io_test_bo_set::
 elf_io_test_bo_set(device* dev, const std::string& xclbin_name) :
   io_test_bo_set_base(dev, xclbin_name)
-  , m_elf_path(m_local_data_path + "/no-ctrl-packet.elf")
+  , m_txn_bin_path(m_local_data_path + "/ml_txn.bin")
 {
   std::string file;
 
@@ -152,7 +194,7 @@ elf_io_test_bo_set(device* dev, const std::string& xclbin_name) :
       alloc_bo(ibo, m_dev, type);
       break;
     case IO_TEST_BO_INSTRUCTION:
-      ibo.size = exec_buf::get_ctrl_code_size(m_elf_path);
+      ibo.size = exec_buf::get_ctrl_code_size(txn_file2elf(m_txn_bin_path));
       if (ibo.size == 0)
         throw std::runtime_error("instruction size cannot be 0");
       alloc_bo(ibo, m_dev, type);
@@ -255,33 +297,19 @@ init_cmd(xrt_core::cuidx_type idx, bool dump)
   auto dev_id = device_query<query::pcie_device>(m_dev);
 
   exec_buf ebuf(*m_bo_array[IO_TEST_BO_CMD].tbo.get(), ERT_START_NPU);
+  auto elf = txn_file2elf(m_txn_bin_path);
 
   ebuf.set_cu_idx(idx);
-  if (dev_id == npu1_device_id) {
-    ebuf.add_ctrl_bo(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get());
-    ebuf.add_arg_32(3);
-    ebuf.add_arg_64(0);
-    ebuf.add_arg_64(0);
-    ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_PARAMETERS].tbo.get());
-    ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_INPUT].tbo.get());
-    ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_OUTPUT].tbo.get());
-    ebuf.add_arg_64(0);
-    ebuf.add_arg_64(0);
-    ebuf.patch_ctrl_code(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get(), m_elf_path);
-  } else if (dev_id == npu4_device_id) {
-    ebuf.add_ctrl_bo(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get());
-    ebuf.add_arg_32(3);
-    ebuf.add_arg_64(0);
-    ebuf.add_arg_64(0);
-    ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_INPUT].tbo.get());
-    ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_PARAMETERS].tbo.get());
-    ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_OUTPUT].tbo.get());
-    ebuf.add_arg_64(0);
-    ebuf.add_arg_64(0);
-    ebuf.patch_ctrl_code(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get(), m_elf_path);
-  } else {
-    throw std::runtime_error("Device ID not supported: " + std::to_string(dev_id));
-  }
+  ebuf.add_ctrl_bo(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get());
+  ebuf.add_arg_64(3);
+  ebuf.add_arg_64(0);
+  ebuf.add_arg_32(0);
+  ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_INPUT].tbo.get());
+  ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_PARAMETERS].tbo.get());
+  ebuf.add_arg_bo(*m_bo_array[IO_TEST_BO_OUTPUT].tbo.get());
+  ebuf.add_arg_64(0);
+  ebuf.add_arg_64(0);
+  ebuf.patch_ctrl_code(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get(), elf);
   if (dump)
     ebuf.dump();
 }
@@ -328,10 +356,15 @@ verify_result()
   auto ofm_golden_p = reinterpret_cast<char*>(buf_ofm_golden.data());
   read_data_from_bin(m_local_data_path + "/ofm.bin", 0, sz, reinterpret_cast<int*>(ofm_golden_p));
 
+  auto [ valid_per_sec, sec_size, total_size ] = get_ofm_format(m_local_data_path + "/ofm_format.ini");
+  if (total_size == 0)
+    valid_per_sec = sec_size = total_size = sz;
   size_t count = 0;
-  for (size_t i = 0; i < sz; i++) {
-    if (ofm_p[i] != ofm_golden_p[i])
-      count++;
+  for (size_t i = 0; i < total_size; i += sec_size) {
+    for (size_t j = i; j < i + valid_per_sec; j++) {
+      if (ofm_p[i] != ofm_golden_p[i])
+        count++;
+    }
   }
   if (count)
     throw std::runtime_error(std::to_string(count) + " bytes result mismatch!!!");
